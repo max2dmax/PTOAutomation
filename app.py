@@ -4,9 +4,26 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+load_dotenv()
 
-PTO_CHANNEL = os.environ["PTO_CHANNEL_ID"]   # e.g. C0123456789
-CAL_ID = os.environ["PTO_CAL_ID"]            # shared PTO calendar id
+# --- Env vars (safe load + validation) ---
+PTO_CHANNEL = os.getenv("PTO_CHANNEL_ID")   # e.g., C0123456789
+CAL_ID      = os.getenv("PTO_CAL_ID")       # shared PTO calendar id
+SLACK_BOT   = os.getenv("SLACK_BOT_TOKEN")
+SIGN_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+APP_LEVEL   = os.getenv("SLACK_APP_LEVEL_TOKEN")
+
+missing = [k for k, v in {
+    "PTO_CHANNEL_ID": PTO_CHANNEL,
+    "PTO_CAL_ID": CAL_ID,
+    "SLACK_BOT_TOKEN": SLACK_BOT,
+    "SLACK_SIGNING_SECRET": SIGN_SECRET,
+    "SLACK_APP_LEVEL_TOKEN": APP_LEVEL
+}.items() if not v]
+if missing:
+    raise SystemExit(f"❌ Missing env var(s): {', '.join(missing)}. Check your .env file.")
 
 # Google
 creds = service_account.Credentials.from_service_account_file(
@@ -16,22 +33,50 @@ creds = service_account.Credentials.from_service_account_file(
 cal = build("calendar", "v3", credentials=creds)
 
 # DB
-db = sqlite3.connect("pto.db", check_same_thread=False)
-db.execute("""CREATE TABLE IF NOT EXISTS pto_links(
-  slack_ts TEXT PRIMARY KEY,
-  slack_channel TEXT,
-  slack_user TEXT,
-  target_user TEXT,
-  event_id TEXT,
-  calendar_id TEXT,
-  start_iso TEXT,
-  end_iso TEXT,
-  note TEXT
-)""")
+DB_PATH = "pto.db"
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.execute("""CREATE TABLE IF NOT EXISTS pto_links(
+          slack_ts TEXT PRIMARY KEY,
+          slack_channel TEXT,
+          slack_user TEXT,
+          target_user TEXT,
+          event_id TEXT,
+          calendar_id TEXT,
+          start_iso TEXT,
+          end_iso TEXT,
+          note TEXT
+        )""")
+        return conn
+    except sqlite3.DatabaseError as e:
+        # If the file exists but isn't a valid DB, back it up and recreate
+        print(f"⚠️ SQLite error: {e}. Backing up and recreating {DB_PATH}…")
+        try:
+            if os.path.exists(DB_PATH):
+                os.rename(DB_PATH, DB_PATH + ".corrupt")
+        except Exception:
+            pass
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.execute("""CREATE TABLE IF NOT EXISTS pto_links(
+          slack_ts TEXT PRIMARY KEY,
+          slack_channel TEXT,
+          slack_user TEXT,
+          target_user TEXT,
+          event_id TEXT,
+          calendar_id TEXT,
+          start_iso TEXT,
+          end_iso TEXT,
+          note TEXT
+        )""")
+        return conn
+
+db = init_db()
+print("***** DB ready and env loaded. Starting Slack app…")
 
 app = App(
-    token=os.environ["SLACK_BOT_TOKEN"],
-    signing_secret=os.environ["SLACK_SIGNING_SECRET"],
+    token=SLACK_BOT,
+    signing_secret=SIGN_SECRET,
 )
 
 # 1) Global shortcut to open modal (configure in Slack: "log-pto")
@@ -61,11 +106,19 @@ def open_modal(ack, body, client):
                     "label": {"type": "plain_text", "text": "Date"},
                     "element": {"type": "datepicker", "action_id": "date_a"}
                 },
+                # End Date
+                {
+                    "type": "input",
+                    "block_id": "date_end_b",
+                    "label": {"type": "plain_text", "text": "End Date"},
+                    "element": {"type": "datepicker", "action_id": "date_end_a"}
+                },
                 # Start
                 {
                     "type": "input",
                     "block_id": "start_b",
                     "label": {"type": "plain_text", "text": "Start (HH:MM, 24h)"},
+                    "optional": True,
                     "element": {"type": "plain_text_input", "action_id": "start_a", "placeholder": {"type": "plain_text", "text": "09:00"}}
                 },
                 # End
@@ -73,6 +126,7 @@ def open_modal(ack, body, client):
                     "type": "input",
                     "block_id": "end_b",
                     "label": {"type": "plain_text", "text": "End (HH:MM, 24h)"},
+                    "optional": True,
                     "element": {"type": "plain_text_input", "action_id": "end_a", "placeholder": {"type": "plain_text", "text": "17:00"}}
                 },
                 # Note
@@ -93,50 +147,118 @@ def handle_submit(ack, body, client, logger):
     values = body["view"]["state"]["values"]
     target_user = values["user_b"]["user_a"]["selected_user"]
     date = values["date_b"]["date_a"]["selected_date"]
-    start = values["start_b"]["start_a"]["value"].strip()
-    end = values["end_b"]["end_a"]["value"].strip()
+    date_end = values.get("date_end_b", {}).get("date_end_a", {}).get("selected_date", date)
+    start = (values.get("start_b", {}).get("start_a", {}).get("value") or "").strip()
+    end = (values.get("end_b", {}).get("end_a", {}).get("value") or "").strip()
     note = values.get("note_b", {}).get("note_a", {}).get("value", "") or ""
-    errors = {}
 
     # baby validation
+    errors = {}
     def _valid_time(t):
         try:
             hh, mm = t.split(":")
             return 0 <= int(hh) < 24 and 0 <= int(mm) < 60
         except Exception:
             return False
-    if not _valid_time(start): errors["start_b"] = "Use HH:MM (24h), like 09:00"
-    if not _valid_time(end): errors["end_b"] = "Use HH:MM (24h), like 17:00"
+
+    # times optional
+    if start and not _valid_time(start):
+        errors["start_b"] = "Use HH:MM (24h), like 09:00"
+    if end and not _valid_time(end):
+        errors["end_b"] = "Use HH:MM (24h), like 17:00"
+
+    # date range check
+    if date_end < date:
+        errors["date_end_b"] = "End Date must be on or after Start Date."
+
+    if start and not end:
+        errors["end_b"] = "Provide an end time or leave both times empty for all-day."
+    if end and not start:
+        errors["start_b"] = "Provide a start time or leave both times empty for all-day."
+
     if errors:
         return ack(response_action="errors", errors=errors)
     ack()  # modal closes
 
-    start_iso = f"{date}T{start}:00"
-    end_iso = f"{date}T{end}:00"
-
-    # Create Google Calendar event
-    try:
-        ev = cal.events().insert(calendarId=CAL_ID, body={
-            "summary": f"PTO - Slack {target_user}",
+    tz = "America/Los_Angeles"
+    # Build event body depending on whether times were provided
+    if start and end:
+        # timed multi-day supported
+        start_iso = f"{date}T{start}:00"
+        end_iso = f"{date_end}T{end}:00"
+        try:
+            if datetime.fromisoformat(start_iso) >= datetime.fromisoformat(end_iso):
+                return ack(response_action="errors", errors={"end_b": "End must be after start."})
+        except Exception:
+            return ack(response_action="errors", errors={"end_b": "Invalid date/time."})
+        event_body = {
+            "summary": "",  # fill later with display name
             "description": f"Requested via Slack by <@{body['user']['id']}> for <@{target_user}>.\n{note}",
-            "start": {"dateTime": start_iso},
-            "end": {"dateTime": end_iso},
-        }).execute()
+            "start": {"dateTime": start_iso, "timeZone": tz},
+            "end": {"dateTime": end_iso, "timeZone": tz},
+        }
+    else:
+        # all-day event (end date exclusive)
+        try:
+            d0 = datetime.fromisoformat(date).date()
+            d1 = datetime.fromisoformat(date_end).date()
+        except Exception:
+            return ack(response_action="errors", errors={"date_end_b": "Invalid date(s)."})
+        end_exclusive = (d1 + timedelta(days=1)).isoformat()
+        event_body = {
+            "summary": "",  # fill later with display name
+            "description": f"Requested via Slack by <@{body['user']['id']}> for <@{target_user}>.\n{note}",
+            "start": {"date": d0.isoformat()},
+            "end": {"date": end_exclusive},
+        }
+
+    # Resolve display name for nicer titles
+    try:
+        ui = client.users_info(user=target_user)
+        # SlackResponse behaves like a dict; support both
+        user_obj = ui.get("user") if hasattr(ui, "get") else ui["user"]
+        profile = user_obj.get("profile", {})
+        display = profile.get("display_name") or profile.get("real_name") or f"<@{target_user}>"
+    except Exception:
+        display = f"<@{target_user}>"
+    event_body["summary"] = f"PTO - {display}"
+
+    try:
+        ev = cal.events().insert(calendarId=CAL_ID, body=event_body).execute()
     except Exception as e:
         logger.error(e)
-        # DM the submitter if Calendar fails
         client.chat_postMessage(channel=body["user"]["id"], text=f"⚠️ Couldn’t create calendar event: {e}")
         return
 
-    # Post summary in #pto (this is the thing they can delete to remove)
     msg = client.chat_postMessage(
         channel=PTO_CHANNEL,
-        text=f"PTO booked for <@{target_user}> on {date} {start}-{end}. {('— ' + note) if note else ''}\n_Delete this message to remove from calendar._"
+        text=f"PTO booked for {display} ({'<@'+target_user+'>'}) — {date}" +
+             (f" → {date_end}" if date_end != date else "") +
+             (f" {start}-{end}" if start and end else " (all-day)") +
+             (f" — {note}" if note else ""),
+        blocks=[
+            {"type": "section",
+             "text": {"type": "mrkdwn",
+                      "text": f"*PTO booked* for {display} (<@{target_user}>) — {date}" +
+                              (f" → {date_end}" if date_end != date else "") +
+                              (f" {start}-{end}" if start and end else " (all-day)") +
+                              (f" — {note}" if note else "")}},
+            {"type": "actions",
+             "elements": [
+                 {"type": "button", "action_id": "pto_delete", "style": "danger",
+                  "text": {"type": "plain_text", "text": "Delete PTO"},
+                  "value": "delete"}
+             ]}
+        ]
     )
 
     # Store mapping
     db.execute("INSERT OR REPLACE INTO pto_links VALUES (?,?,?,?,?,?,?,?,?)", (
-        msg["ts"], PTO_CHANNEL, body["user"]["id"], target_user, ev["id"], CAL_ID, start_iso, end_iso, note
+        msg["ts"], PTO_CHANNEL, body["user"]["id"], target_user,
+        ev["id"], CAL_ID,
+        event_body["start"].get("dateTime") or event_body["start"].get("date"),
+        event_body["end"].get("dateTime") or event_body["end"].get("date"),
+        note
     ))
     db.commit()
 
@@ -144,6 +266,7 @@ def handle_submit(ack, body, client, logger):
 @app.event("message")
 def on_message_events(event, logger):
     if event.get("subtype") == "message_deleted":
+        logger.info(f"🧽 message_deleted event: channel={event.get('channel')} ts={event.get('previous_message', {}).get('ts')}")
         ts = event["previous_message"]["ts"]
         row = db.execute("SELECT event_id, calendar_id FROM pto_links WHERE slack_ts=?", (ts,)).fetchone()
         if row:
@@ -155,7 +278,32 @@ def on_message_events(event, logger):
             db.execute("DELETE FROM pto_links WHERE slack_ts=?", (ts,))
             db.commit()
 
+# Delete button handler for PTO messages
+@app.action("pto_delete")
+def handle_pto_delete(ack, body, client, logger):
+    ack()
+    # Determine the channel and ts of the message with the button
+    channel_id = body.get("channel", {}).get("id") or body.get("container", {}).get("channel_id")
+    ts = body.get("message", {}).get("ts")
+    if not channel_id or not ts:
+        logger.error(f"Delete action missing channel/ts: {body}")
+        return
+    row = db.execute("SELECT event_id, calendar_id FROM pto_links WHERE slack_ts=?", (ts,)).fetchone()
+    if row:
+        event_id, cal_id = row
+        try:
+            cal.events().delete(calendarId=cal_id, eventId=event_id).execute()
+        except Exception as e:
+            logger.error(e)
+        db.execute("DELETE FROM pto_links WHERE slack_ts=?", (ts,))
+        db.commit()
+    # Remove the Slack message
+    try:
+        client.chat_delete(channel=channel_id, ts=ts)
+    except Exception as e:
+        logger.error(e)
+
 if __name__ == "__main__":
     # For local dev, you can run via Socket Mode (no ngrok) if you enable it in Slack
-    handler = SocketModeHandler(app, os.environ["SLACK_APP_LEVEL_TOKEN"])  # xapp- token
+    handler = SocketModeHandler(app, APP_LEVEL)  # xapp- token
     handler.start()
