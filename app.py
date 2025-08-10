@@ -48,6 +48,12 @@ def init_db():
           end_iso TEXT,
           note TEXT
         )""")
+        # Channel → Calendar mapping
+        conn.execute("""CREATE TABLE IF NOT EXISTS channel_settings(
+          channel_id TEXT PRIMARY KEY,
+          calendar_id TEXT NOT NULL
+        )""")
+        conn.commit()
         return conn
     except sqlite3.DatabaseError as e:
         # If the file exists but isn't a valid DB, back it up and recreate
@@ -69,9 +75,23 @@ def init_db():
           end_iso TEXT,
           note TEXT
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS channel_settings(
+          channel_id TEXT PRIMARY KEY,
+          calendar_id TEXT NOT NULL
+        )""")
+        conn.commit()
         return conn
 
 db = init_db()
+
+def get_calendar_for_channel(channel_id: str) -> str:
+    row = db.execute("SELECT calendar_id FROM channel_settings WHERE channel_id=?", (channel_id,)).fetchone()
+    return row[0] if row else CAL_ID  # fallback to env if not configured
+
+def set_calendar_for_channel(channel_id: str, calendar_id: str):
+    db.execute("INSERT OR REPLACE INTO channel_settings(channel_id, calendar_id) VALUES(?,?)", (channel_id, calendar_id))
+    db.commit()
+
 print("***** DB ready and env loaded. Starting Slack app…")
 
 app = App(
@@ -98,6 +118,17 @@ def open_modal(ack, body, client):
                     "block_id": "user_b",
                     "label": {"type": "plain_text", "text": "Employee"},
                     "element": {"type": "users_select", "action_id": "user_a", "initial_user": body["user"]["id"]}
+                },
+                {
+                    "type": "input",
+                    "block_id": "channel_b",
+                    "label": {"type": "plain_text", "text": "Post PTO to channel"},
+                    "element": {
+                        "type": "conversations_select",
+                        "action_id": "channel_a",
+                        "default_to_current_conversation": True,
+                        "filter": {"include": ["public", "private"], "exclude_bot_users": True}
+                    }
                 },
                 # Date
                 {
@@ -141,10 +172,105 @@ def open_modal(ack, body, client):
         }
     )
 
+@app.command("/pto")
+def cmd_pto(ack, body, client):
+    ack()
+    channel_id = body.get("channel_id")
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "pto_submit",
+            "title": {"type": "plain_text", "text": "Log PTO"},
+            "submit": {"type": "plain_text", "text": "Create"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "private_metadata": channel_id,
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "user_b",
+                    "label": {"type": "plain_text", "text": "Employee"},
+                    "element": {"type": "users_select", "action_id": "user_a", "initial_user": body["user_id"]}
+                },
+                {
+                    "type": "input",
+                    "block_id": "date_b",
+                    "label": {"type": "plain_text", "text": "Date"},
+                    "element": {"type": "datepicker", "action_id": "date_a"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "date_end_b",
+                    "label": {"type": "plain_text", "text": "End Date"},
+                    "element": {"type": "datepicker", "action_id": "date_end_a"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "start_b",
+                    "label": {"type": "plain_text", "text": "Start (HH:MM, 24h)"},
+                    "optional": True,
+                    "element": {"type": "plain_text_input", "action_id": "start_a", "placeholder": {"type": "plain_text", "text": "09:00"}}
+                },
+                {
+                    "type": "input",
+                    "block_id": "end_b",
+                    "label": {"type": "plain_text", "text": "End (HH:MM, 24h)"},
+                    "optional": True,
+                    "element": {"type": "plain_text_input", "action_id": "end_a", "placeholder": {"type": "plain_text", "text": "17:00"}}
+                },
+                {
+                    "type": "input",
+                    "optional": True,
+                    "block_id": "note_b",
+                    "label": {"type": "plain_text", "text": "Reason / Note"},
+                    "element": {"type": "plain_text_input", "action_id": "note_a", "multiline": True}
+                }
+            ]
+        }
+    )
+
+# /pto-setup <calendar_id>  — admin command to bind this channel to a Google Calendar
+@app.command("/pto-setup")
+def pto_setup(ack, respond, body, client, logger):
+    ack()
+    channel_id = body.get("channel_id")
+    text = (body.get("text") or "").strip()
+    if not text:
+        return respond("Usage: `/pto-setup <calendar_id>` (e.g. abc123@group.calendar.google.com)")
+    cal_id = text.split()[0]
+
+    # Optional: validate we can write to this calendar by inserting a tiny event then deleting it
+    try:
+        test = cal.events().insert(calendarId=cal_id, body={
+            "summary": "PTO Bot validation (auto-delete)",
+            "start": {"dateTime": datetime.utcnow().isoformat()+"Z"},
+            "end": {"dateTime": (datetime.utcnow()+timedelta(minutes=5)).isoformat()+"Z"},
+        }).execute()
+        cal.events().delete(calendarId=cal_id, eventId=test["id"]).execute()
+    except Exception as e:
+        logger.error(f"Calendar validation failed for {cal_id}: {e}")
+        return respond(f"❌ I can't write to `{cal_id}`. Make sure this calendar is shared with the service account and try again.")
+
+    set_calendar_for_channel(channel_id, cal_id)
+    respond(f"✅ This channel is now mapped to calendar:\n`{cal_id}`")
+
+@app.command("/pto-where")
+def pto_where(ack, respond, body):
+    ack()
+    channel_id = body.get("channel_id")
+    current = get_calendar_for_channel(channel_id)
+    respond(f"📌 This channel writes PTO to:\n`{current}`")
+
 # 2) Handle modal submit → create calendar event → post summary in #pto
 @app.view("pto_submit")
 def handle_submit(ack, body, client, logger):
     values = body["view"]["state"]["values"]
+
+    # Figure out which channel to post in:
+    modal_channel = values.get("channel_b", {}).get("channel_a", {}).get("selected_conversation")
+    pm = body.get("view", {}).get("private_metadata")
+    post_channel = modal_channel or pm or PTO_CHANNEL
+
     target_user = values["user_b"]["user_a"]["selected_user"]
     date = values["date_b"]["date_a"]["selected_date"]
     date_end = values.get("date_end_b", {}).get("date_end_a", {}).get("selected_date", date)
@@ -223,15 +349,17 @@ def handle_submit(ack, body, client, logger):
         display = f"<@{target_user}>"
     event_body["summary"] = f"PTO - {display}"
 
+    cal_id_target = get_calendar_for_channel(post_channel)
+
     try:
-        ev = cal.events().insert(calendarId=CAL_ID, body=event_body).execute()
+        ev = cal.events().insert(calendarId=cal_id_target, body=event_body).execute()
     except Exception as e:
         logger.error(e)
         client.chat_postMessage(channel=body["user"]["id"], text=f"⚠️ Couldn’t create calendar event: {e}")
         return
 
     msg = client.chat_postMessage(
-        channel=PTO_CHANNEL,
+        channel=post_channel,
         text=f"PTO booked for {display} ({'<@'+target_user+'>'}) — {date}" +
              (f" → {date_end}" if date_end != date else "") +
              (f" {start}-{end}" if start and end else " (all-day)") +
@@ -254,8 +382,8 @@ def handle_submit(ack, body, client, logger):
 
     # Store mapping
     db.execute("INSERT OR REPLACE INTO pto_links VALUES (?,?,?,?,?,?,?,?,?)", (
-        msg["ts"], PTO_CHANNEL, body["user"]["id"], target_user,
-        ev["id"], CAL_ID,
+        msg["ts"], post_channel, body["user"]["id"], target_user,
+        ev["id"], cal_id_target,
         event_body["start"].get("dateTime") or event_body["start"].get("date"),
         event_body["end"].get("dateTime") or event_body["end"].get("date"),
         note
